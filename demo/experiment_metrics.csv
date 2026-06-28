@@ -1,0 +1,6 @@
+experiment,metric_name,metric_value,unit,split,notes
+baseline,accuracy,89.4,percent,validation,Transformer baseline
+rag-enhanced,accuracy,92.5,percent,validation,Retrieval augmented configuration
+rag-enhanced,latency,284,ms,test,Median end-to-end latency
+reranker,f1,91.2,percent,test,Cross-encoder reranking enabled
+

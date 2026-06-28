@@ -1,0 +1,30 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+data/
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+.DS_Store
+
+# IDE
+.idea/
+
+# Test artifacts
+.pytest-*/
+pytest-cache-files-*/
+
+# TypeScript build artifacts
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Logs
+*.log
