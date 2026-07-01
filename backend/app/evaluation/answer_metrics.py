@@ -594,7 +594,13 @@ def format_markdown_report(report: AnswerReport) -> str:
             "## Results by Answer Type",
             "",
         ])
-        for atype, scheme_dict in report.by_answer_type.items():
+        # by_answer_type is dict[scheme, dict[answer_type, summary]]
+        # Outer loop: answer type; inner loop: scheme
+        all_answer_types: set[str] = set()
+        for scheme_dict in report.by_answer_type.values():
+            all_answer_types.update(scheme_dict.keys())
+
+        for atype in sorted(all_answer_types):
             lines.append(f"### {atype}")
             lines.append("")
             lines.append("| Metric | " + " | ".join(report.schemes) + " |")
@@ -602,7 +608,8 @@ def format_markdown_report(report: AnswerReport) -> str:
             for label, key in metrics_rows:
                 row = [label]
                 for scheme in report.schemes:
-                    summary = scheme_dict.get(scheme)
+                    scheme_dict = report.by_answer_type.get(scheme, {})
+                    summary = scheme_dict.get(atype)
                     if summary:
                         row.append(format_percent(getattr(summary, key)))
                     else:

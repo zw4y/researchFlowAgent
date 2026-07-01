@@ -7,6 +7,7 @@ Schemes:
   D. ResearchFlow full pipeline (Vector Top 20 + rerank Top 6)
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -152,13 +153,32 @@ class AnswerEvaluationRunner:
         self,
         cases: list[AnswerCase],
         scheme: AnswerScheme,
+        *,
+        concurrency: int = 5,
     ) -> list[AnswerCase]:
-        """Generate answers for all cases using one scheme."""
+        """Generate answers for all cases using one scheme, with concurrency limit."""
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _run_one(case: AnswerCase) -> AnswerCase:
+            async with semaphore:
+                return await self._generate_and_evaluate(case, scheme)
+
+        tasks = [_run_one(case) for case in cases]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
         updated: list[AnswerCase] = []
-        for case in cases:
-            updated.append(
-                await self._generate_and_evaluate(case, scheme)
-            )
+        for case, result in zip(cases, results, strict=False):
+            if isinstance(result, Exception):
+                logger.error("Scheme %s case %s failed: %s", scheme, case.case_id, result)
+                case.answers[scheme] = GeneratedAnswer(
+                    case_id=case.case_id,
+                    scheme=scheme,
+                    answer_text=f"[error] {result}",
+                    tool_call_success=False,
+                )
+                updated.append(case)
+            else:
+                updated.append(result)
         return updated
 
     async def _generate_and_evaluate(
