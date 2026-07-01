@@ -1,6 +1,8 @@
 # Handoff: DeepSeek V4 Flash — Answer-Level Evaluation
 
 - **模型名称和版本**: deepseek-v4-flash (325f4346-ebbc-46f2-a066-5b8a2a099ca7)
+- **Agent身份**: ZCode / deepseek-v4-flash (代码实现+测试执行)
+- **运行时LLM**: Qwen-turbo (DashScope，仅用于评测API调用)
 - **开始时所在Commit**: `fd7f726` (add production RAG and web search)
 - **使用的分支**: `handoff/deepseek-v4/answer-evaluation`
 
@@ -18,11 +20,13 @@
 | `backend/tests/test_answer_evaluation.py` | 40个单元测试覆盖所有核心指标逻辑 |
 | `docs/agent-handoffs/deepseek-v4-answer-evaluation.md` | **本交接文档** |
 
-### 修改的文件
+### 实时代码修改（本Session内）
 
 | 文件 | 修改内容 |
 | --- | --- |
 | `backend/app/evaluation/models.py` | 在 `EvaluationCase.label_status` 增加了 `independent_model_verified` Literal 选项 |
+| `backend/app/evaluation/answer_runner.py` | 添加 `asyncio` 并发执行（`Semaphore(5)`），`_run_scheme` 从顺序改为 `asyncio.gather` 并行 |
+| `backend/app/evaluation/answer_metrics.py` | 修复 `extract_numeric_values` 单位提取bug（使用match group 1替代手写逻辑）；修复 `aggregate_answer_metrics` grounding_rate空序列崩溃；修复 `format_markdown_report` 分层报告模板（by_answer_type外循环改为answer type）；删除未使用变量和import |
 
 ## 新增功能
 
@@ -59,7 +63,7 @@
 - 按题型分层 (factual/numeric_table/training等)
 - 按论文分层
 - Bootstrap 95%置信区间 (10,000次重采样)
-- Markdown报告自动生成
+- Markdown报告自动生成（含表格、分层、Bootstrap区间）
 
 ### 5. 失败案例分析 (Task 5)
 在 `answer_runner.py:AnswerEvaluationRunner._analyze_failures()` 中自动识别:
@@ -68,23 +72,59 @@
 - 低忠实度 (<30%)
 - 引用问题
 
-## 测试命令与结果
+## 质量检查
 
 ```bash
-# 单元测试（40个新测试 + 36个现有测试 = 76 passed）
+# 单元测试（40个新测试 + 36个现有 = 76 passed）
 python -m pytest backend/tests -v
-
-# 新增测试专项
-python -m pytest backend/tests/test_answer_evaluation.py -v
+# → 76 passed in 2.57s
 
 # Ruff
 python -m ruff check backend/
+# → All checks passed
 
 # Mypy
 python -m mypy backend/app/evaluation/
-
-# 结果：76 passed, ruff all checks passed, mypy no issues found
+# → Success: no issues found in 11 source files
 ```
+
+## 性能优化
+
+**问题**: 初始 `_run_scheme` 顺序执行90条×4方案=360次API调用，预计耗时6~24分钟（实测超时10分钟）。
+
+**优化**: 添加 `asyncio.Semaphore(5)` 并发控制 + `asyncio.gather` 并行执行。
+
+```python
+# 优化前：顺序 await
+async def _run_scheme(self, cases, scheme):
+    updated = []
+    for case in cases:
+        updated.append(await self._generate_and_evaluate(case, scheme))
+    return updated
+
+# 优化后：5路并发
+async def _run_scheme(self, cases, scheme, *, concurrency=5):
+    semaphore = asyncio.Semaphore(concurrency)
+    async def _run_one(case):
+        async with semaphore:
+            return await self._generate_and_evaluate(case, scheme)
+    tasks = [_run_one(case) for case in cases]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+```
+
+优化后耗时约3~4分钟完成全部360次调用。
+
+## .env临时变更
+
+本Session内 `.env` 经历了三次变更:
+
+| 阶段 | CHAT_API_KEY | CHAT_BASE_URL | CHAT_MODEL |
+|------|-------------|--------------|-----------|
+| 初始（原始） | sk-1ab2... | `https://api.deepseek.com` | `deepseek-v4-flash` |
+| 评测运行 | sk-ws-H....(Qwen) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-turbo` |
+| 恢复后 | sk-1ab2... | `https://api.deepseek.com` | `deepseek-v4-flash` |
+
+**未修改**: `DASHSCOPE_API_KEY`、`EMBEDDING_*`、`RERANK_*`、`TAVILY_API_KEY` 等配置。
 
 ## API调用情况
 
@@ -102,9 +142,16 @@ python -m mypy backend/app/evaluation/
 - Qdrant 向量检索 90次（本地，免费）
 - qwen3-rerank 90次（DashScope，约0.003元×90≈0.27元）
 
-运行CLI命令:
+### 运行过的CLI命令
+
 ```bash
-# 停止Uvicorn，避免Qdrant Local文件锁冲突
+# 1. Smoke test (2条×4方案，验证管线)
+python -m app.evaluation.answer_cli \
+  --dataset demo/evaluation/15-paper-test-cases.jsonl \
+  --output data/evaluations/answer-smoke \
+  --limit 2
+
+# 2. 完整评测 (90条×4方案，带并发)
 python -m app.evaluation.answer_cli \
   --dataset demo/evaluation/15-paper-test-cases.jsonl \
   --output data/evaluations/answer-full
@@ -163,18 +210,13 @@ python -m app.evaluation.answer_cli \
 2. **数值表格瓶颈**: 34题 numeric_table 中所有方案准确率均低（RF 24.23%），需改进OCR和数值提取
 3. **全文上下文反而高幻觉**: 全文方案 Hallucination Rate 2.81% 高于 Vector RAG 的 1.85% — 过多上下文导致模型分心
 4. **闭卷零数值匹配**: 闭卷回答 Numeric Exact Match = 0% — 论文领域专业数值通用模型无法回答
-
-### 报告文件
-
-- JSON: `data/evaluations/answer-full/answer_report.json` (984KB)
-- Markdown: `data/evaluations/answer-full/answer_report.md` (56KB, 583行)
-- 命令行日志: 已保存至工作区artifact
+5. **初始超时**: 第一次运行因顺序执行360次API调用而超时（10分钟），添加并发后成功完成
 
 ## 已知问题
 
 1. **Semantic Correctness**: 当前 `answer_correctness` 使用 `max(F1, keyword_coverage)` 作为代理。对于语义类问题，建议使用独立LLM Judge（Judge看不到方案名称、随机化顺序、保存理由）。
 2. **Citation Accuracy**: 当前为简化启发式（检测"page N"在答案中出现），需要更精确的引用解析。
-3. **LLM调用**: 四种方案都需要DeepSeek API调用，在首次运行时需注意API额度和超时。
+3. **LLM调用**: 四种方案都需要LLM API调用。本次使用 Qwen-turbo，后续可切换回 DeepSeek V4 重跑对比。
 4. **Qdrant锁**: 运行评测时需先停止Uvicorn（`Ctrl+C`），避免Qdrant Local文件锁冲突。
 5. **verify_cases.py**: 需要数据库中的Chunk数据支持，且 `verify_test_case` 函数中的 paper title 匹配需要验证。
 6. **`_researchflow` runner**: 需要先在容器中启动检索服务，当前直接访问vector_store和rerank_provider。
@@ -186,6 +228,7 @@ python -m app.evaluation.answer_cli \
 3. **人工抽查**: 用户需要抽查约10%~20%的 `independent_model_verified` 标签
 4. **verify_cases.py 运行**: 需要针对15篇论文的Chunk数据运行核验（当前框架已就绪）
 5. **检索回归测试**: 如果修改了 retrieval.py，需要重新运行检索评测
+6. **DeepSeek V4重跑**: 当前结果为 Qwen-turbo，用原始 DeepSeek V4 重跑可对比模型间差异
 
 ## 是否修改评测数据
 
@@ -200,9 +243,16 @@ python -m app.evaluation.answer_cli \
 - 向量检索: Qdrant Local (免费)
 - 测试完成后 `.env` 已恢复为 DeepSeek V4 配置
 
-### 最终提交
+## 报告文件
 
-| Commit | Hash | 描述 |
-|--------|------|------|
-| 1 | `bcbbcb3` | eval: add answer-level evaluation framework |
-| 2 | `b174980` | docs: update handoff with final commit hash |
+- 完整报告JSON: `data/evaluations/answer-full/answer_report.json` (984KB, 90 cases × 4 schemes)
+- 完整报告Markdown: `data/evaluations/answer-full/answer_report.md` (56KB, 616行)
+- Smoke测试: `data/evaluations/answer-smoke/answer_report.json` (2 cases)
+
+## 最终提交
+
+| # | Commit | Hash | 描述 |
+|---|--------|------|------|
+| 1 | `bcbbcb3` | 2026-07-01 | eval: add answer-level evaluation framework |
+| 2 | `b174980` | 2026-07-01 | docs: update handoff with final commit hash |
+| 3 | `79ac8d9` | 2026-07-01 | docs: update handoff with Qwen-turbo evaluation results |
