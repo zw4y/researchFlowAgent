@@ -129,4 +129,4 @@ python -m app.evaluation.answer_cli \
 
 ## 最终Commit Hash
 
-（提交后填写）
+`bcbbcb3` (eval: add answer-level evaluation framework)
