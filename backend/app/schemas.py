@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+IndexStatus = Literal["pending", "indexing", "ready", "stale", "failed"]
+
 
 class PaperOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -13,6 +15,9 @@ class PaperOut(BaseModel):
     page_count: int
     status: str
     error_message: str | None
+    index_status: IndexStatus
+    index_profile: str | None
+    indexed_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -24,6 +29,8 @@ class IngestionJobOut(BaseModel):
     paper_id: str
     status: str
     progress: int
+    job_type: str
+    details: dict[str, Any]
     error_message: str | None
     created_at: datetime
     updated_at: datetime
@@ -33,6 +40,28 @@ class PaperUploadResponse(BaseModel):
     paper: PaperOut
     ingestion_job: IngestionJobOut
     duplicated: bool = False
+
+
+class ReindexResponse(BaseModel):
+    paper_id: str
+    job_id: str
+    status: Literal["queued"] = "queued"
+
+
+class IndexStatusResponse(BaseModel):
+    provider: str
+    model: str
+    dimensions: int
+    profile_id: str
+    collection: str
+    vector_store_mode: str
+    collection_ready: bool
+    point_count: int
+    paper_counts: dict[str, int]
+    embedding_configured: bool
+    rerank_provider: str
+    rerank_model: str
+    rerank_configured: bool
 
 
 class CitationOut(BaseModel):
@@ -101,6 +130,9 @@ class HealthResponse(BaseModel):
     database: str
     vector_store: str
     llm: str
+    embedding: str
+    rerank: str
+    index_profile: str
     web_search: str
 
 

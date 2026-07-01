@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,6 +10,7 @@ __pycache__/
 .coverage
 htmlcov/
 data/
+tmp/
 frontend/node_modules/
 frontend/dist/
 frontend/playwright-report/

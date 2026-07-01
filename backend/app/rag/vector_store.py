@@ -1,147 +1,150 @@
-import math
-from dataclasses import dataclass
-from typing import Any, Protocol
+from collections.abc import Sequence
+from typing import Any
 
+from llama_index.core import VectorStoreIndex
+from llama_index.core.embeddings import BaseEmbedding
+from llama_index.core.schema import BaseNode, NodeWithScore
+from llama_index.core.vector_stores import (
+    FilterCondition,
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+)
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from pydantic import PrivateAttr
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
-    MatchAny,
     MatchValue,
-    PointStruct,
     VectorParams,
 )
 
-
-@dataclass(slots=True)
-class VectorRecord:
-    id: str
-    vector: list[float]
-    payload: dict[str, Any]
+from app.core.config import Settings
+from app.providers.base import EmbeddingProvider
+from app.rag.index_profile import IndexProfile
 
 
-@dataclass(slots=True)
-class VectorHit:
-    id: str
-    score: float
-    payload: dict[str, Any]
+class ProviderEmbeddingAdapter(BaseEmbedding):
+    _provider: EmbeddingProvider = PrivateAttr()
+
+    def __init__(self, provider: EmbeddingProvider, batch_size: int) -> None:
+        super().__init__(model_name=provider.model_name, embed_batch_size=batch_size)
+        self._provider = provider
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        raise RuntimeError("ResearchFlow 仅使用异步 LlamaIndex Embedding 接口。")
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        raise RuntimeError("ResearchFlow 仅使用异步 LlamaIndex Embedding 接口。")
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return await self._provider.embed_query(query)
+
+    async def _aget_text_embedding(self, text: str) -> list[float]:
+        return (await self._provider.embed_documents([text]))[0]
+
+    async def _aget_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return await self._provider.embed_documents(texts)
 
 
-class VectorStore(Protocol):
-    name: str
-
-    async def upsert(self, records: list[VectorRecord]) -> None: ...
-
-    async def search(
-        self, vector: list[float], paper_ids: list[str], limit: int
-    ) -> list[VectorHit]: ...
-
-    async def delete_paper(self, paper_id: str) -> None: ...
-
-    async def close(self) -> None: ...
-
-
-class InMemoryVectorStore:
-    name = "memory"
-
-    def __init__(self) -> None:
-        self._records: dict[str, VectorRecord] = {}
-
-    async def upsert(self, records: list[VectorRecord]) -> None:
-        self._records.update({record.id: record for record in records})
-
-    async def search(
-        self, vector: list[float], paper_ids: list[str], limit: int
-    ) -> list[VectorHit]:
-        allowed = set(paper_ids)
-        hits: list[VectorHit] = []
-        for record in self._records.values():
-            if allowed and record.payload.get("paper_id") not in allowed:
-                continue
-            score = self._cosine(vector, record.vector)
-            hits.append(VectorHit(id=record.id, score=score, payload=record.payload))
-        return sorted(hits, key=lambda item: item.score, reverse=True)[:limit]
-
-    async def delete_paper(self, paper_id: str) -> None:
-        self._records = {
-            key: record
-            for key, record in self._records.items()
-            if record.payload.get("paper_id") != paper_id
-        }
-
-    async def close(self) -> None:
-        return None
+class LlamaIndexVectorStore:
+    def __init__(
+        self,
+        settings: Settings,
+        profile: IndexProfile,
+        embedding_provider: EmbeddingProvider,
+    ) -> None:
+        self.settings = settings
+        self.profile = profile
+        self.name = settings.vector_store_mode
+        self.client = self._build_client(settings)
+        self.embedding_adapter = ProviderEmbeddingAdapter(
+            embedding_provider,
+            settings.embedding_batch_size,
+        )
+        self.store = QdrantVectorStore(
+            collection_name=profile.collection_name,
+            aclient=self.client,
+            dense_config=VectorParams(size=profile.dimensions, distance=Distance.COSINE),
+            batch_size=64,
+            index_doc_id=True,
+        )
+        self.index = VectorStoreIndex.from_vector_store(
+            self.store,
+            embed_model=self.embedding_adapter,
+        )
 
     @staticmethod
-    def _cosine(left: list[float], right: list[float]) -> float:
-        numerator = sum(a * b for a, b in zip(left, right, strict=False))
-        left_norm = math.sqrt(sum(value * value for value in left))
-        right_norm = math.sqrt(sum(value * value for value in right))
-        return numerator / (left_norm * right_norm) if left_norm and right_norm else 0.0
-
-
-class QdrantVectorStore:
-    name = "qdrant"
-
-    def __init__(self, url: str, collection: str) -> None:
-        self.client = AsyncQdrantClient(url=url)
-        self.collection = collection
-        self._dimensions: int | None = None
-
-    async def _ensure_collection(self, dimensions: int) -> None:
-        if self._dimensions == dimensions:
-            return
-        exists = await self.client.collection_exists(self.collection)
-        if not exists:
-            await self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=VectorParams(size=dimensions, distance=Distance.COSINE),
-            )
-        self._dimensions = dimensions
-
-    async def upsert(self, records: list[VectorRecord]) -> None:
-        if not records:
-            return
-        await self._ensure_collection(len(records[0].vector))
-        await self.client.upsert(
-            collection_name=self.collection,
-            points=[
-                PointStruct(id=item.id, vector=item.vector, payload=item.payload)
-                for item in records
-            ],
-            wait=True,
+    def _build_client(settings: Settings) -> AsyncQdrantClient:
+        if settings.vector_store_mode == "memory":
+            return AsyncQdrantClient(location=":memory:")
+        if settings.vector_store_mode == "qdrant_local":
+            return AsyncQdrantClient(path=str(settings.qdrant_path))
+        return AsyncQdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+            timeout=30,
         )
 
-    async def search(
-        self, vector: list[float], paper_ids: list[str], limit: int
-    ) -> list[VectorHit]:
-        await self._ensure_collection(len(vector))
-        query_filter = None
-        if paper_ids:
-            query_filter = Filter(
-                must=[FieldCondition(key="paper_id", match=MatchAny(any=paper_ids))]
-            )
-        response = await self.client.query_points(
-            collection_name=self.collection,
-            query=vector,
-            query_filter=query_filter,
-            limit=limit,
-            with_payload=True,
-        )
-        return [
-            VectorHit(id=str(item.id), score=item.score, payload=dict(item.payload or {}))
-            for item in response.points
+    async def add_nodes(self, nodes: Sequence[BaseNode]) -> None:
+        if nodes:
+            await self.index.ainsert_nodes(nodes)
+
+    async def retrieve(
+        self,
+        query: str,
+        paper_ids: list[str],
+        limit: int,
+    ) -> list[NodeWithScore]:
+        filters: list[MetadataFilter] = [
+            MetadataFilter(key="index_profile", value=self.profile.profile_id)
         ]
+        if paper_ids:
+            filters.append(
+                MetadataFilter(
+                    key="paper_id",
+                    value=paper_ids,
+                    operator=FilterOperator.IN,
+                )
+            )
+        retriever = self.index.as_retriever(
+            similarity_top_k=limit,
+            filters=MetadataFilters(filters=filters, condition=FilterCondition.AND),
+        )
+        return await retriever.aretrieve(query)
 
     async def delete_paper(self, paper_id: str) -> None:
-        await self.client.delete(
-            collection_name=self.collection,
-            points_selector=Filter(
-                must=[FieldCondition(key="paper_id", match=MatchValue(value=paper_id))]
-            ),
-            wait=True,
-        )
+        response = await self.client.get_collections()
+        prefix = f"{self.settings.qdrant_collection}_"
+        for collection in response.collections:
+            if not collection.name.startswith(prefix):
+                continue
+            await self.client.delete(
+                collection_name=collection.name,
+                points_selector=Filter(
+                    must=[FieldCondition(key="paper_id", match=MatchValue(value=paper_id))]
+                ),
+                wait=True,
+            )
+
+    async def current_collection_exists(self) -> bool:
+        return await self.client.collection_exists(self.profile.collection_name)
+
+    async def current_point_count(self) -> int:
+        if not await self.current_collection_exists():
+            return 0
+        info = await self.client.get_collection(self.profile.collection_name)
+        return int(info.points_count or 0)
 
     async def close(self) -> None:
         await self.client.close()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "mode": self.name,
+            "collection": self.profile.collection_name,
+            "profile_id": self.profile.profile_id,
+            "dimensions": self.profile.dimensions,
+        }

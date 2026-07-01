@@ -118,7 +118,13 @@ class ToolRegistry:
     @staticmethod
     def _summarize(value: Any) -> str:
         if isinstance(value, list):
-            return f"返回 {len(value)} 条结果"
+            statuses = {
+                str(getattr(item, "retrieval_status", ""))
+                for item in value
+                if getattr(item, "retrieval_status", None)
+            }
+            suffix = f"，检索状态：{', '.join(sorted(statuses))}" if statuses else ""
+            return f"返回 {len(value)} 条结果{suffix}"
         text = str(value)
         return text[:300]
 

@@ -11,6 +11,7 @@ import {
   PanelRight,
   Paperclip,
   Plus,
+  RefreshCw,
   Send,
   Square,
   Trash2,
@@ -24,12 +25,26 @@ import type {
   Citation,
   ConversationSummary,
   Health,
+  IndexStatus,
   Message,
   Paper,
   ToolCall
 } from "./types";
 
 type EvidenceTab = "citations" | "tools";
+
+function isPaperQueryable(paper: Paper): boolean {
+  return paper.status === "ready" && paper.index_status === "ready";
+}
+
+function paperStatusLabel(paper: Paper): string {
+  if (paper.status === "failed") return paper.error_message ?? "论文处理失败";
+  if (paper.status === "pending" || paper.status === "processing") return "正在解析论文";
+  if (paper.index_status === "indexing" || paper.index_status === "pending") return "正在构建索引";
+  if (paper.index_status === "stale") return "索引过期，需要重建";
+  if (paper.index_status === "failed") return "索引失败，可重新构建";
+  return `${paper.page_count} 页 · 可检索`;
+}
 
 function App() {
   const [papers, setPapers] = useState<Paper[]>([]);
@@ -41,7 +56,9 @@ function App() {
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [question, setQuestion] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [webEnabled, setWebEnabled] = useState(true);
   const [health, setHealth] = useState<Health>();
+  const [indexStatus, setIndexStatus] = useState<IndexStatus>();
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [evidenceTab, setEvidenceTab] = useState<EvidenceTab>("citations");
@@ -53,14 +70,16 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextPapers, nextConversations, nextHealth] = await Promise.all([
+      const [nextPapers, nextConversations, nextHealth, nextIndexStatus] = await Promise.all([
         api.papers(),
         api.conversations(),
-        api.health()
+        api.health(),
+        api.indexStatus()
       ]);
       setPapers(nextPapers);
       setConversations(nextConversations);
       setHealth(nextHealth);
+      setIndexStatus(nextIndexStatus);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "服务连接失败");
     }
@@ -71,7 +90,18 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
-    if (papers.some((paper) => paper.status === "pending" || paper.status === "processing")) {
+    if (health && health.web_search !== "enabled") {
+      setWebEnabled(false);
+    }
+  }, [health]);
+
+  useEffect(() => {
+    if (papers.some((paper) =>
+      paper.status === "pending" ||
+      paper.status === "processing" ||
+      paper.index_status === "pending" ||
+      paper.index_status === "indexing"
+    )) {
       const timer = window.setInterval(() => void refresh(), 1500);
       return () => window.clearInterval(timer);
     }
@@ -82,9 +112,10 @@ function App() {
   }, [messages]);
 
   const selectedReadyPapers = useMemo(
-    () => papers.filter((paper) => selectedPapers.has(paper.id) && paper.status === "ready"),
+    () => papers.filter((paper) => selectedPapers.has(paper.id) && isPaperQueryable(paper)),
     [papers, selectedPapers]
   );
+  const webSearchAvailable = health?.web_search === "enabled";
 
   async function handleUpload(file?: File) {
     if (!file) return;
@@ -114,6 +145,17 @@ function App() {
     }
   }
 
+  async function reindexPaper(paperId: string) {
+    setError(undefined);
+    try {
+      await api.reindexPaper(paperId);
+      setNotice("索引重建任务已启动");
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "索引重建失败");
+    }
+  }
+
   async function removePaper(paperId: string) {
     try {
       await api.deletePaper(paperId);
@@ -128,11 +170,15 @@ function App() {
     }
   }
 
-  function togglePaper(paperId: string) {
+  function togglePaper(paper: Paper) {
+    if (!isPaperQueryable(paper)) {
+      setNotice("该论文需要完成当前 Embedding 索引后才能用于问答");
+      return;
+    }
     setSelectedPapers((current) => {
       const next = new Set(current);
-      if (next.has(paperId)) next.delete(paperId);
-      else next.add(paperId);
+      if (next.has(paper.id)) next.delete(paper.id);
+      else next.add(paper.id);
       return next;
     });
   }
@@ -179,8 +225,8 @@ function App() {
         {
           question: prompt,
           conversation_id: conversationId,
-          paper_ids: [...selectedPapers],
-          enable_web: true
+          paper_ids: selectedReadyPapers.map((paper) => paper.id),
+          enable_web: webSearchAvailable && webEnabled
         },
         (event) => {
           if (event.event === "token") {
@@ -239,9 +285,14 @@ function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <div className={`service-status ${health?.status ?? "degraded"}`}>
+          <div
+            className={`service-status ${health?.status ?? "degraded"}`}
+            title={indexStatus
+              ? `Embedding: ${indexStatus.model} (${indexStatus.dimensions}d) · Rerank: ${indexStatus.rerank_model} · ${indexStatus.point_count} vectors`
+              : "正在读取模型服务状态"}
+          >
             <span />
-            {health?.llm === "fake" ? "本地演示" : health?.status === "ok" ? "服务正常" : "配置不完整"}
+            {health?.status === "ok" ? "检索服务正常" : "配置不完整"}
           </div>
           <button className="icon-button mobile-only" onClick={() => setEvidenceOpen(true)} title="证据">
             <PanelRight size={19} />
@@ -294,26 +345,27 @@ function App() {
             {papers.length === 0 && <div className="empty-compact">暂无论文</div>}
             {papers.map((paper) => (
               <div className={`paper-row ${selectedPapers.has(paper.id) ? "selected" : ""}`} key={paper.id}>
-                <button className="paper-main" onClick={() => togglePaper(paper.id)}>
+                <button className="paper-main" onClick={() => togglePaper(paper)}>
                   <span className="paper-check">
-                    {paper.status === "ready" && selectedPapers.has(paper.id) ? <Check size={13} /> : null}
-                    {paper.status === "processing" || paper.status === "pending" ? <span className="spinner" /> : null}
-                    {paper.status === "failed" ? <CircleAlert size={13} /> : null}
+                    {isPaperQueryable(paper) && selectedPapers.has(paper.id) ? <Check size={13} /> : null}
+                    {paper.status === "processing" || paper.status === "pending" || paper.index_status === "indexing" || paper.index_status === "pending" ? <span className="spinner" /> : null}
+                    {paper.status === "failed" || paper.index_status === "failed" || paper.index_status === "stale" ? <CircleAlert size={13} /> : null}
                   </span>
                   <span className="paper-copy">
                     <strong>{paper.title}</strong>
-                    <small>
-                      {paper.status === "ready"
-                        ? `${paper.page_count} 页`
-                        : paper.status === "failed"
-                          ? paper.error_message
-                          : "正在处理"}
-                    </small>
+                    <small>{paperStatusLabel(paper)}</small>
                   </span>
                 </button>
-                <button className="row-action" onClick={() => void removePaper(paper.id)} title="删除论文">
-                  <Trash2 size={15} />
-                </button>
+                <div className="paper-actions">
+                  {paper.status === "ready" && (paper.index_status === "stale" || paper.index_status === "failed") && (
+                    <button className="row-action persistent" onClick={() => void reindexPaper(paper.id)} title="重建论文索引">
+                      <RefreshCw size={15} />
+                    </button>
+                  )}
+                  <button className="row-action" onClick={() => void removePaper(paper.id)} title="删除论文">
+                    <Trash2 size={15} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -341,7 +393,7 @@ function App() {
                 : "未选择论文"}
             </span>
             {selectedReadyPapers.slice(0, 2).map((paper) => (
-              <button className="context-chip" key={paper.id} onClick={() => togglePaper(paper.id)}>
+              <button className="context-chip" key={paper.id} onClick={() => togglePaper(paper)}>
                 {paper.title}<X size={12} />
               </button>
             ))}
@@ -393,8 +445,31 @@ function App() {
                   <Paperclip size={17} />
                 </button>
                 <div className="composer-modes">
-                  <span><Globe2 size={14} /> 联网</span>
-                  <span><Database size={14} /> 指标</span>
+                  <button
+                    type="button"
+                    className={`mode-button ${webSearchAvailable && webEnabled ? "active" : ""}`}
+                    disabled={!webSearchAvailable || streaming}
+                    aria-label="联网搜索"
+                    aria-pressed={webSearchAvailable && webEnabled}
+                    onClick={() => setWebEnabled((current) => !current)}
+                    title={webSearchAvailable
+                      ? webEnabled ? "联网搜索已开启，点击关闭" : "联网搜索已关闭，点击开启"
+                      : "未配置 Tavily API Key"}
+                  >
+                    <Globe2 size={14} /> 联网
+                  </button>
+                  <button
+                    type="button"
+                    className="mode-button"
+                    disabled={selectedReadyPapers.length !== 1 || streaming}
+                    aria-label="导入实验指标"
+                    onClick={() => metricsInput.current?.click()}
+                    title={selectedReadyPapers.length === 1
+                      ? "为当前论文导入实验指标 CSV"
+                      : "请选择一篇可检索论文"}
+                  >
+                    <Database size={14} /> 指标
+                  </button>
                 </div>
                 <button
                   className="send-button"
