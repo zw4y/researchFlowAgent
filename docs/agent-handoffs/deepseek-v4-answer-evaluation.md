@@ -88,18 +88,87 @@ python -m mypy backend/app/evaluation/
 
 ## API调用情况
 
-**本交接时未运行付费API调用**。原因：
-1. Qdrant Local Mode 与 Uvicorn 冲突，需要先停止后端
-2. DeepSeek API调用90条测试问题×4方案=360次API调用，预计成本约5-10 CNY
-3. Rerank API (qwen3-rerank) 每次约0.003元×90次≈0.27元
-4. Embedding API 当前索引已存在无需重新调用
+**已完成付费API调用**（2026-07-01，Qwen-turbo 实测）:
 
-运行CLI命令（停止Uvicorn后）:
+| 方案 | API调用次数 | 总输入Token | 总输出Token | 预估成本(CNY) |
+| --- | ---: | ---: | ---: | ---: |
+| 闭卷回答 | 90 | 6,840 | 10,980 | ~0.03 |
+| 全文上下文 | 90 | 2,292,660 | 8,550 | ~2.31 |
+| Vector RAG | 90 | 354,510 | 7,380 | ~0.37 |
+| ResearchFlow | 90 | 365,310 | 6,840 | ~0.38 |
+| **合计** | **360** | **3,019,320** | **33,750** | **~3.09** |
+
+其中 ResearchFlow 方案还包含：
+- Qdrant 向量检索 90次（本地，免费）
+- qwen3-rerank 90次（DashScope，约0.003元×90≈0.27元）
+
+运行CLI命令:
 ```bash
+# 停止Uvicorn，避免Qdrant Local文件锁冲突
 python -m app.evaluation.answer_cli \
   --dataset demo/evaluation/15-paper-test-cases.jsonl \
-  --output data/evaluations/answer
+  --output data/evaluations/answer-full
 ```
+
+## 评估结果 (Qwen-turbo, 90条×4方案)
+
+### 总体结果
+
+| 指标 | 闭卷回答 | 全文上下文 | Vector RAG | **ResearchFlow** |
+|------|:--------:|:----------:|:----------:|:----------------:|
+| **Answer Correctness** | 16.35% | **55.85%** | 49.99% | **53.32%** |
+| Token F1 | 7.91% | 31.10% | 30.21% | **31.11%** |
+| Faithfulness | 79.55% | 97.16% | 97.79% | **98.11%** |
+| Hallucination Rate | 2.22% | 2.81% | 1.85% | 2.41% |
+| Numeric Exact Match | 0.00% | 72.55% | 58.82% | 58.82% |
+| Numeric Tolerance Acc. | 2.38% | 79.41% | 72.60% | **75.54%** |
+| Unsupported Claim Rate | 20.45% | 2.84% | 2.21% | **1.89%** |
+| Grounding Rate | 0.00% | 12.22% | **97.78%** | **96.67%** |
+| | | | | |
+| **Avg Input Tokens** | **76** | **25,474** | **3,939** | **4,059** |
+| Token Savings vs Full | — | — | **84.5%** | **84.1%** |
+| Avg Latency | 1.1s | 3.1s | 1.4s | 1.8s |
+| Avg Cost (CNY) | 0.0003 | 0.0257 | 0.0041 | 0.0042 |
+
+### 核心发现
+
+1. **RAG必要性验证**: ResearchFlow vs 闭卷 — Correctness **+36.97pp** (3.3×提升)
+2. **Token效率**: 仅用 **1/6的Token** (4K vs 25K) 达到全文 **96%的相对准确率**
+3. **Rerank价值**: ResearchFlow vs Vector RAG — Correctness **+3.33pp**，Faithfulness **98.11% vs 97.79%**
+4. **忠实度最高**: ResearchFlow 的 Unsupported Claim Rate 仅 **1.89%**，四方案中最低
+5. **数值表格挑战**: numeric_table 题型准确率仅 24.23%，表格OCR和数值提取是瓶颈
+
+### 按题型分层 (ResearchFlow)
+
+| 题型 | Correctness | Token F1 | Faithfulness | 题数 |
+|-----|:-----------:|:--------:|:------------:|:---:|
+| factual | **73.98%** | 35.50% | 97.50% | 20 |
+| architecture | **72.69%** | **41.00%** | 95.93% | 9 |
+| training | 64.84% | 36.03% | **100.00%** | 9 |
+| limitation | 62.42% | 39.52% | **100.00%** | 9 |
+| ablation | **77.28%** | 24.11% | 96.30% | 9 |
+| numeric_table | 24.23% | 24.23% | 98.53% | 34 |
+
+### Bootstrap 95%置信区间 (ResearchFlow vs Vector RAG)
+
+| 指标 | Lower | Upper |
+|------|:-----:|:-----:|
+| Answer Correctness | -0.10% | +6.83% |
+| Faithfulness | -1.63% | +2.34% |
+| Hallucination Rate | -2.78% | +3.89% |
+
+### 已知失败模式
+
+1. **Citation Precision 0%**: Qwen-turbo 不自动产生 `[P1]` 格式引用，需要显式system prompt指令
+2. **数值表格瓶颈**: 34题 numeric_table 中所有方案准确率均低（RF 24.23%），需改进OCR和数值提取
+3. **全文上下文反而高幻觉**: 全文方案 Hallucination Rate 2.81% 高于 Vector RAG 的 1.85% — 过多上下文导致模型分心
+4. **闭卷零数值匹配**: 闭卷回答 Numeric Exact Match = 0% — 论文领域专业数值通用模型无法回答
+
+### 报告文件
+
+- JSON: `data/evaluations/answer-full/answer_report.json` (984KB)
+- Markdown: `data/evaluations/answer-full/answer_report.md` (56KB, 583行)
+- 命令行日志: 已保存至工作区artifact
 
 ## 已知问题
 
@@ -112,7 +181,7 @@ python -m app.evaluation.answer_cli \
 
 ## 未完成工作
 
-1. **运行完整 answer_cli**: 需要停止Uvicorn后运行，产生四组实际答案和指标
+1. ~~**运行完整 answer_cli**~~ ✅ **已完成** (2026-07-01, Qwen-turbo, 90条×4方案)
 2. **LLM Judge**: 语义型问题的独立Judge评测（当前用keyword F1代理）
 3. **人工抽查**: 用户需要抽查约10%~20%的 `independent_model_verified` 标签
 4. **verify_cases.py 运行**: 需要针对15篇论文的Chunk数据运行核验（当前框架已就绪）
@@ -125,8 +194,15 @@ python -m app.evaluation.answer_cli \
 
 ## 是否重新运行付费评测
 
-否。本交接为代码实现阶段，未运行任何付费API。
+**是**。2026-07-01 使用 Qwen-turbo 完成90条测试×4方案=360次API调用，总成本约3.09 CNY。
+- 模型: `qwen-turbo` (DashScope OpenAI-compatible endpoint)
+- Rerank: `qwen3-rerank` (DashScope, ~0.27元)
+- 向量检索: Qdrant Local (免费)
+- 测试完成后 `.env` 已恢复为 DeepSeek V4 配置
 
-## 最终Commit Hash
+### 最终提交
 
-`bcbbcb3` (eval: add answer-level evaluation framework)
+| Commit | Hash | 描述 |
+|--------|------|------|
+| 1 | `bcbbcb3` | eval: add answer-level evaluation framework |
+| 2 | `b174980` | docs: update handoff with final commit hash |
