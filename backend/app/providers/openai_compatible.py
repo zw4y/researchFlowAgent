@@ -1,5 +1,6 @@
+import hashlib
 import json
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from openai import AsyncOpenAI
 
@@ -10,8 +11,15 @@ from app.providers.base import Evidence, RouteName, WebResult
 class OpenAICompatibleChatProvider:
     name = "openai_compatible"
 
-    def __init__(self, api_key: str | None, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str,
+        model: str,
+        thinking: Literal["default", "enabled", "disabled"] = "default",
+    ) -> None:
         self.model = model
+        self._extra_body = None if thinking == "default" else {"thinking": {"type": thinking}}
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url) if api_key else None
 
     def _require_client(self) -> AsyncOpenAI:
@@ -28,6 +36,7 @@ class OpenAICompatibleChatProvider:
             model=self.model,
             messages=messages,  # type: ignore[arg-type]
             temperature=0.2,
+            extra_body=self._extra_body,
         )
         return response.choices[0].message.content or ""
 
@@ -46,6 +55,7 @@ class OpenAICompatibleChatProvider:
             ],
             response_format={"type": "json_object"},
             temperature=0,
+            extra_body=self._extra_body,
         )
         return json.loads(response.choices[0].message.content or "{}")
 
@@ -74,6 +84,20 @@ class OpenAICompatibleChatProvider:
         web_results: list[WebResult],
         metric_rows: list[dict[str, Any]],
     ) -> str:
+        if not evidence and not web_results and not metric_rows:
+            return await self.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are ResearchFlow, a research workflow assistant. Answer the "
+                            "user directly in the same language. Do not invent citations, and make "
+                            "clear when a claim would require uploaded papers or web evidence."
+                        ),
+                    },
+                    {"role": "user", "content": question},
+                ]
+            )
         paper_context = "\n".join(
             f"[P{index}] {item.paper_title}, page {item.page}, chunk {item.chunk_id}: {item.text}"
             for index, item in enumerate(evidence, start=1)
@@ -112,16 +136,50 @@ class OpenAICompatibleChatProvider:
 class OpenAICompatibleEmbeddingProvider:
     name = "openai_compatible"
 
-    def __init__(self, api_key: str | None, base_url: str, model: str) -> None:
-        self.model = model
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str,
+        model: str,
+        dimensions: int,
+    ) -> None:
+        self.model_name = model
+        self.dimensions = dimensions
+        identity = f"{self.name}:{model}:{dimensions}"
+        self.profile_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        self.configured = bool(api_key)
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url) if api_key else None
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    def _require_client(self) -> AsyncOpenAI:
         if self._client is None:
             raise AppError(
                 "未配置 EMBEDDING_API_KEY，无法生成向量。",
                 status_code=503,
                 code="embedding_not_configured",
             )
-        response = await self._client.embeddings.create(model=self.model, input=texts)
-        return [item.embedding for item in response.data]
+        return self._client
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        response = await self._require_client().embeddings.create(
+            model=self.model_name,
+            input=texts,
+            dimensions=self.dimensions,
+            encoding_format="float",
+        )
+        ordered = sorted(response.data, key=lambda item: item.index)
+        vectors = [item.embedding for item in ordered]
+        self._validate(vectors, len(texts))
+        return vectors
+
+    async def embed_query(self, query: str) -> list[float]:
+        return (await self.embed_documents([query]))[0]
+
+    def _validate(self, vectors: list[list[float]], expected: int) -> None:
+        if len(vectors) != expected or any(len(item) != self.dimensions for item in vectors):
+            raise AppError(
+                "Embedding 服务返回的向量数量或维度不正确。",
+                status_code=502,
+                code="embedding_invalid_response",
+            )

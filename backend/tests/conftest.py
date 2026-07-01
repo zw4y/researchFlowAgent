@@ -7,6 +7,13 @@ from app.main import app
 from httpx import ASGITransport, AsyncClient
 from reportlab.pdfgen import canvas
 
+from tests.doubles import (
+    DeterministicChatProvider,
+    DeterministicEmbeddingProvider,
+    DeterministicRerankProvider,
+    DeterministicToolSelector,
+)
+
 
 @pytest.fixture
 def sample_pdf(tmp_path: Path) -> Path:
@@ -45,11 +52,18 @@ async def container(tmp_path: Path):
         app_env="test",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
         upload_dir=tmp_path / "uploads",
-        llm_mode="fake",
+        chat_api_key="test-key",
+        dashscope_api_key="test-key",
         vector_store_mode="memory",
         retrieval_score_threshold=0,
     )
-    instance = AppContainer(settings)
+    instance = AppContainer(
+        settings,
+        chat_provider=DeterministicChatProvider(),
+        tool_selector=DeterministicToolSelector(),
+        embedding_provider=DeterministicEmbeddingProvider(),
+        rerank_provider=DeterministicRerankProvider(),
+    )
     await instance.start()
     yield instance
     await instance.close()

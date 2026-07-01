@@ -4,6 +4,9 @@ export interface Paper {
   original_filename: string;
   page_count: number;
   status: "pending" | "processing" | "ready" | "failed";
+  index_status: "pending" | "indexing" | "ready" | "stale" | "failed";
+  index_profile: string | null;
+  indexed_at: string | null;
   error_message: string | null;
   created_at: string;
   updated_at: string;
@@ -66,11 +69,35 @@ export interface Health {
   database: string;
   vector_store: string;
   llm: string;
+  embedding: string;
+  rerank: string;
+  index_profile: string;
   web_search: string;
+}
+
+export interface IndexStatus {
+  provider: string;
+  model: string;
+  dimensions: number;
+  profile_id: string;
+  collection: string;
+  vector_store_mode: string;
+  collection_ready: boolean;
+  point_count: number;
+  paper_counts: Record<string, number>;
+  embedding_configured: boolean;
+  rerank_provider: string;
+  rerank_model: string;
+  rerank_configured: boolean;
+}
+
+export interface ReindexResponse {
+  paper_id: string;
+  job_id: string;
+  status: "queued";
 }
 
 export interface SseEvent {
   event: string;
   data: unknown;
 }
-

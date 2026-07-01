@@ -4,13 +4,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import UploadFile
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.db.models import Chunk, IngestionJob, Paper
-from app.rag.vector_store import VectorStore
+from app.rag.index_profile import IndexProfile
+from app.rag.vector_store import LlamaIndexVectorStore
 
 
 class PaperService:
@@ -18,11 +19,13 @@ class PaperService:
         self,
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
-        vector_store: VectorStore,
+        vector_store: LlamaIndexVectorStore,
+        profile: IndexProfile,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.vector_store = vector_store
+        self.profile = profile
 
     async def create_upload(self, upload: UploadFile) -> tuple[Paper, IngestionJob, bool]:
         filename = Path(upload.filename or "paper.pdf").name
@@ -49,7 +52,12 @@ class PaperService:
                     .order_by(IngestionJob.created_at.desc())
                 )
                 if job is None:
-                    job = IngestionJob(paper_id=existing.id, status=existing.status, progress=100)
+                    job = IngestionJob(
+                        paper_id=existing.id,
+                        status=existing.status,
+                        progress=100,
+                        job_type="ingest",
+                    )
                     session.add(job)
                     await session.commit()
                     await session.refresh(job)
@@ -63,8 +71,13 @@ class PaperService:
                 original_filename=filename,
                 stored_filename=stored_filename,
                 sha256=digest,
+                index_status="pending",
             )
-            job = IngestionJob(paper_id=paper_id)
+            job = IngestionJob(
+                paper_id=paper_id,
+                job_type="ingest",
+                details={"target_profile": self.profile.profile_id},
+            )
             session.add_all([paper, job])
             await session.commit()
             await session.refresh(paper)
@@ -79,6 +92,7 @@ class PaperService:
                 failed_job = await session.get(IngestionJob, job.id)
                 if failed_paper:
                     failed_paper.status = "failed"
+                    failed_paper.index_status = "failed"
                     failed_paper.error_message = "文件保存失败"
                 if failed_job:
                     failed_job.status = "failed"
@@ -86,6 +100,58 @@ class PaperService:
                 await session.commit()
             raise
         return paper, job, False
+
+    async def create_reindex_job(self, paper_id: str) -> tuple[Paper, IngestionJob]:
+        async with self.session_factory() as session:
+            paper = await session.get(Paper, paper_id)
+            if paper is None:
+                raise AppError("论文不存在。", status_code=404, code="paper_not_found")
+            if not (self.settings.upload_dir / paper.stored_filename).exists():
+                raise AppError("论文源文件不存在，无法重建索引。", code="paper_file_missing")
+            running = await session.scalar(
+                select(IngestionJob).where(
+                    IngestionJob.paper_id == paper_id,
+                    IngestionJob.status.in_(["queued", "processing"]),
+                )
+            )
+            if running:
+                raise AppError("该论文已有索引任务正在运行。", status_code=409, code="job_running")
+            job = IngestionJob(
+                paper_id=paper_id,
+                job_type="reindex",
+                details={"target_profile": self.profile.profile_id},
+            )
+            paper.index_status = "pending"
+            paper.error_message = None
+            session.add(job)
+            await session.commit()
+            await session.refresh(paper)
+            await session.refresh(job)
+            return paper, job
+
+    async def mark_stale_indexes(self) -> int:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(Paper)
+                .where(
+                    Paper.status == "ready",
+                    or_(
+                        Paper.index_profile.is_(None),
+                        Paper.index_profile != self.profile.profile_id,
+                    ),
+                    Paper.index_status != "indexing",
+                )
+                .values(index_status="stale")
+            )
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    async def index_status_counts(self) -> dict[str, int]:
+        async with self.session_factory() as session:
+            rows = await session.execute(
+                select(Paper.index_status, func.count(Paper.id)).group_by(Paper.index_status)
+            )
+            return {str(status): int(count) for status, count in rows}
 
     async def list_papers(self) -> list[Paper]:
         async with self.session_factory() as session:

@@ -14,11 +14,13 @@ from app.schemas import (
     ChatResponse,
     ConversationOut,
     HealthResponse,
+    IndexStatusResponse,
     IngestionJobOut,
     MessageOut,
     MetricImportResponse,
     PaperOut,
     PaperUploadResponse,
+    ReindexResponse,
     StructuredChatRequest,
     StructuredChatResponse,
     ToolCallOut,
@@ -32,14 +34,47 @@ router = APIRouter()
 @router.get("/health", response_model=HealthResponse, tags=["system"])
 async def health(container: AppContainer = Depends(get_container)) -> HealthResponse:
     llm_status = container.chat_provider.name
-    if container.settings.llm_mode == "openai_compatible" and not container.settings.chat_api_key:
+    if not container.settings.chat_api_key:
         llm_status = "not_configured"
+    embedding_status = (
+        container.embedding_provider.name
+        if container.embedding_provider.configured
+        else "not_configured"
+    )
+    rerank_status = container.rerank_provider.name
+    if container.rerank_provider.enabled and not container.rerank_provider.configured:
+        rerank_status = "not_configured"
+    degraded = "not_configured" in {llm_status, embedding_status, rerank_status}
     return HealthResponse(
-        status="ok" if llm_status != "not_configured" else "degraded",
+        status="degraded" if degraded else "ok",
         database=container.database.engine.dialect.name,
         vector_store=container.vector_store.name,
         llm=llm_status,
+        embedding=embedding_status,
+        rerank=rerank_status,
+        index_profile=container.index_profile.profile_id,
         web_search="enabled" if container.search_provider.enabled else "disabled",
+    )
+
+
+@router.get("/index/status", response_model=IndexStatusResponse, tags=["system"])
+async def index_status(
+    container: AppContainer = Depends(get_container),
+) -> IndexStatusResponse:
+    return IndexStatusResponse(
+        provider=container.embedding_provider.name,
+        model=container.embedding_provider.model_name,
+        dimensions=container.embedding_provider.dimensions,
+        profile_id=container.index_profile.profile_id,
+        collection=container.index_profile.collection_name,
+        vector_store_mode=container.vector_store.name,
+        collection_ready=await container.vector_store.current_collection_exists(),
+        point_count=await container.vector_store.current_point_count(),
+        paper_counts=await container.paper_service.index_status_counts(),
+        embedding_configured=container.embedding_provider.configured,
+        rerank_provider=container.rerank_provider.name,
+        rerank_model=container.rerank_provider.model_name,
+        rerank_configured=container.rerank_provider.configured,
     )
 
 
@@ -59,6 +94,12 @@ async def upload_paper(
     file: UploadFile = File(...),
     container: AppContainer = Depends(get_container),
 ) -> PaperUploadResponse:
+    if not container.embedding_provider.configured:
+        raise AppError(
+            "Embedding 服务尚未配置，无法上传并索引论文。",
+            status_code=503,
+            code="embedding_not_configured",
+        )
     paper, job, duplicated = await container.paper_service.create_upload(file)
     if not duplicated or paper.status in {"pending", "failed"}:
         background_tasks.add_task(container.ingestion_service.process, paper.id, job.id)
@@ -75,6 +116,28 @@ async def list_papers(
 @router.get("/papers/{paper_id}", response_model=PaperOut, tags=["papers"])
 async def get_paper(paper_id: str, container: AppContainer = Depends(get_container)) -> PaperOut:
     return PaperOut.model_validate(await container.paper_service.get_paper(paper_id))
+
+
+@router.post(
+    "/papers/{paper_id}/reindex",
+    response_model=ReindexResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["papers"],
+)
+async def reindex_paper(
+    paper_id: str,
+    background_tasks: BackgroundTasks,
+    container: AppContainer = Depends(get_container),
+) -> ReindexResponse:
+    if not container.embedding_provider.configured:
+        raise AppError(
+            "Embedding 服务尚未配置，无法重建索引。",
+            status_code=503,
+            code="embedding_not_configured",
+        )
+    paper, job = await container.paper_service.create_reindex_job(paper_id)
+    background_tasks.add_task(container.ingestion_service.process, paper.id, job.id)
+    return ReindexResponse(paper_id=paper.id, job_id=job.id)
 
 
 @router.delete(

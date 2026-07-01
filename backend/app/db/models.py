@@ -29,6 +29,9 @@ class Paper(Base):
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    index_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    index_profile: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -46,6 +49,7 @@ class Chunk(Base):
     text: Mapped[str] = mapped_column(Text)
     token_count: Mapped[int] = mapped_column(Integer)
     vector_id: Mapped[str] = mapped_column(String(64), unique=True)
+    index_profile: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -56,6 +60,8 @@ class IngestionJob(Base):
     paper_id: Mapped[str] = mapped_column(ForeignKey("papers.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     progress: Mapped[int] = mapped_column(Integer, default=0)
+    job_type: Mapped[str] = mapped_column(String(32), default="ingest")
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

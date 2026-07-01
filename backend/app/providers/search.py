@@ -16,8 +16,8 @@ class TavilySearchProvider:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
                 "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {self.api_key}"},
                 json={
-                    "api_key": self.api_key,
                     "query": query,
                     "search_depth": "advanced",
                     "max_results": max_results,

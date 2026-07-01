@@ -3,7 +3,9 @@ import type {
   ConversationDetail,
   ConversationSummary,
   Health,
+  IndexStatus,
   Paper,
+  ReindexResponse,
   SseEvent
 } from "./types";
 
@@ -23,10 +25,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<Health>("/health"),
+  indexStatus: () => request<IndexStatus>("/index/status"),
   papers: () => request<Paper[]>("/papers"),
   conversations: () => request<ConversationSummary[]>("/conversations"),
   conversation: (id: string) => request<ConversationDetail>(`/conversations/${id}`),
   deletePaper: (id: string) => request<void>(`/papers/${id}`, { method: "DELETE" }),
+  reindexPaper: (id: string) =>
+    request<ReindexResponse>(`/papers/${id}/reindex`, { method: "POST" }),
   uploadPaper: async (file: File) => {
     const body = new FormData();
     body.append("file", file);

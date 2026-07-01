@@ -13,7 +13,7 @@
 
 ## 动手
 
-启动 API，访问 `/api/v1/health` 和 `/docs`；把 `LLM_MODE` 从 `fake` 改成 `openai_compatible`，观察健康状态变化。
+启动 API，访问 `/api/v1/health` 和 `/docs`；暂时移除本地 `CHAT_API_KEY`，观察健康状态如何从正常变为配置不完整，再恢复密钥。
 
 ## 练习
 

@@ -2,13 +2,13 @@
 
 ## 学习目标
 
-掌握 HTTP 状态码、Pydantic 请求响应、OpenAI 兼容 API、Structured Output 和 Fake Provider。
+掌握 HTTP 状态码、Pydantic 请求响应、DeepSeek 的 OpenAI 兼容 API、Structured Output 和依赖注入测试。
 
 ## 代码地图
 
 - `providers/base.py`：Provider Protocol。
 - `providers/openai_compatible.py`：真实模型调用。
-- `providers/fake.py`：可重复、零费用测试。
+- `tests/doubles.py`：通过依赖注入提供可重复、零费用的离线测试。
 - `/api/v1/llm/structured`：结构化输出接口。
 
 ## 动手

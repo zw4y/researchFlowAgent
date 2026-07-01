@@ -5,15 +5,16 @@ from pydantic import BaseModel
 from app.agent.workflow import ResearchWorkflow
 from app.core.config import Settings
 from app.db.session import Database
-from app.providers.base import ChatProvider, EmbeddingProvider
-from app.providers.fake import FakeChatProvider, FakeEmbeddingProvider
+from app.providers.base import ChatProvider, EmbeddingProvider, RerankProvider
+from app.providers.dashscope import DashScopeEmbeddingProvider, DashScopeRerankProvider
 from app.providers.openai_compatible import (
     OpenAICompatibleChatProvider,
     OpenAICompatibleEmbeddingProvider,
 )
 from app.providers.search import TavilySearchProvider
-from app.providers.tool_selector import FakeToolSelector, OpenAIToolSelector, ToolSelector
-from app.rag.vector_store import InMemoryVectorStore, QdrantVectorStore, VectorStore
+from app.providers.tool_selector import OpenAIToolSelector, ToolSelector
+from app.rag.index_profile import IndexProfile
+from app.rag.vector_store import LlamaIndexVectorStore
 from app.services.ingestion import IngestionService
 from app.services.metrics import MetricService
 from app.services.papers import PaperService
@@ -33,50 +34,51 @@ from app.tools.registry import (
 
 
 class AppContainer:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        chat_provider: ChatProvider | None = None,
+        tool_selector: ToolSelector | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+        rerank_provider: RerankProvider | None = None,
+    ) -> None:
         self.settings = settings
         self.database = Database(settings)
-        if settings.llm_mode == "fake":
-            self.chat_provider: ChatProvider = FakeChatProvider()
-            self.embedding_provider: EmbeddingProvider = FakeEmbeddingProvider()
-            self.tool_selector: ToolSelector = FakeToolSelector()
+        if (chat_provider is None) != (tool_selector is None):
+            raise ValueError("chat_provider and tool_selector must be injected together")
+        if chat_provider is None or tool_selector is None:
+            self.chat_provider, self.tool_selector = self._build_chat_provider()
         else:
-            self.chat_provider = OpenAICompatibleChatProvider(
-                settings.chat_api_key,
-                settings.chat_base_url,
-                settings.chat_model,
-            )
-            self.embedding_provider = OpenAICompatibleEmbeddingProvider(
-                settings.embedding_api_key,
-                settings.embedding_base_url,
-                settings.embedding_model,
-            )
-            self.tool_selector = OpenAIToolSelector(
-                settings.chat_api_key,
-                settings.chat_base_url,
-                settings.chat_model,
-            )
-        if settings.vector_store_mode == "qdrant":
-            self.vector_store: VectorStore = QdrantVectorStore(
-                settings.qdrant_url,
-                settings.qdrant_collection,
-            )
-        else:
-            self.vector_store = InMemoryVectorStore()
+            self.chat_provider, self.tool_selector = chat_provider, tool_selector
+        self.embedding_provider = embedding_provider or self._build_embedding_provider()
+        self.rerank_provider = rerank_provider or self._build_rerank_provider()
+        self.index_profile = IndexProfile.build(settings, self.embedding_provider)
+        self.vector_store = LlamaIndexVectorStore(
+            settings,
+            self.index_profile,
+            self.embedding_provider,
+        )
         self.search_provider = TavilySearchProvider(settings.tavily_api_key)
         sessions = self.database.session_factory
-        self.paper_service = PaperService(settings, sessions, self.vector_store)
+        self.paper_service = PaperService(
+            settings,
+            sessions,
+            self.vector_store,
+            self.index_profile,
+        )
         self.ingestion_service = IngestionService(
             settings,
             sessions,
-            self.embedding_provider,
             self.vector_store,
+            self.index_profile,
         )
         self.retrieval_service = RetrievalService(
             settings,
             sessions,
-            self.embedding_provider,
             self.vector_store,
+            self.rerank_provider,
+            self.index_profile,
         )
         self.metric_service = MetricService(sessions)
         self.tools = ToolRegistry(sessions)
@@ -87,6 +89,49 @@ class AppContainer:
             self.tool_selector,
             self.tools,
             self.metric_service,
+        )
+
+    def _build_chat_provider(self) -> tuple[ChatProvider, ToolSelector]:
+        return (
+            OpenAICompatibleChatProvider(
+                self.settings.chat_api_key,
+                self.settings.chat_base_url,
+                self.settings.chat_model,
+                self.settings.chat_thinking,
+            ),
+            OpenAIToolSelector(
+                self.settings.chat_api_key,
+                self.settings.chat_base_url,
+                self.settings.chat_model,
+                self.settings.chat_thinking,
+            ),
+        )
+
+    def _build_embedding_provider(self) -> EmbeddingProvider:
+        if self.settings.embedding_mode == "dashscope":
+            return DashScopeEmbeddingProvider(
+                self.settings.dashscope_api_key,
+                self.settings.embedding_model,
+                self.settings.embedding_dimensions,
+                self.settings.embedding_batch_size,
+                self.settings.embedding_timeout_seconds,
+                self.settings.embedding_max_retries,
+                self.settings.embedding_query_instruction,
+            )
+        return OpenAICompatibleEmbeddingProvider(
+            self.settings.embedding_api_key,
+            self.settings.embedding_base_url,
+            self.settings.embedding_model,
+            self.settings.embedding_dimensions,
+        )
+
+    def _build_rerank_provider(self) -> RerankProvider:
+        return DashScopeRerankProvider(
+            self.settings.dashscope_api_key,
+            self.settings.rerank_model,
+            self.settings.rerank_timeout_seconds,
+            self.settings.rerank_max_retries,
+            self.settings.rerank_instruction,
         )
 
     def _register_tools(self) -> None:
@@ -163,7 +208,7 @@ class AppContainer:
         self.settings.prepare_directories()
         if self.settings.auto_create_tables:
             await self.database.create_tables()
-        await self.retrieval_service.rehydrate_memory_store()
+        await self.paper_service.mark_stale_indexes()
 
     async def close(self) -> None:
         await self.vector_store.close()
