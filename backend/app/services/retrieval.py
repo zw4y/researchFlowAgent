@@ -1,4 +1,6 @@
 import logging
+from dataclasses import dataclass
+from time import perf_counter
 
 from llama_index.core.schema import NodeWithScore
 from sqlalchemy import select
@@ -29,6 +31,16 @@ _TABLE_QUERY_TERMS = (
 )
 
 
+@dataclass(slots=True)
+class RetrievalTrace:
+    candidates: list[NodeWithScore]
+    vector_selected: list[NodeWithScore]
+    selected: list[NodeWithScore]
+    retrieval_status: str
+    vector_latency_ms: int
+    rerank_latency_ms: int
+
+
 class RetrievalService:
     def __init__(
         self,
@@ -45,16 +57,30 @@ class RetrievalService:
         self.profile = profile
 
     async def search(self, query: str, paper_ids: list[str]) -> list[Evidence]:
+        trace = await self.trace(query, paper_ids)
+        return [
+            self._to_evidence(node, trace.retrieval_status)
+            for node in trace.selected
+        ]
+
+    async def trace(
+        self,
+        query: str,
+        paper_ids: list[str],
+        *,
+        candidate_limit: int | None = None,
+    ) -> RetrievalTrace:
         allowed_ids = await self._ready_paper_ids(paper_ids)
         if not allowed_ids:
-            return []
-        candidate_limit = self.settings.retrieval_candidates
-        if self._is_table_query(query):
-            candidate_limit = max(candidate_limit, 40)
+            return RetrievalTrace([], [], [], "vector", 0, 0)
+        resolved_limit = candidate_limit or self.settings.retrieval_candidates
+        if candidate_limit is None and self._is_table_query(query):
+            resolved_limit = max(resolved_limit, 40)
+        vector_started = perf_counter()
         nodes = await self.vector_store.retrieve(
             query,
             allowed_ids,
-            candidate_limit,
+            resolved_limit,
         )
         candidates = [
             node
@@ -63,9 +89,21 @@ class RetrievalService:
         ]
         for candidate in candidates:
             candidate.node.metadata["vector_score"] = float(candidate.score or 0.0)
+        top_n = min(self.settings.rerank_top_n, len(candidates))
+        vector_selected = candidates[:top_n]
+        vector_latency_ms = round((perf_counter() - vector_started) * 1000)
+        rerank_started = perf_counter()
         selected, retrieval_status = await self._rerank(query, candidates)
         selected = self._prioritize_table_summaries(query, candidates, selected)
-        return [self._to_evidence(node, retrieval_status) for node in selected]
+        rerank_latency_ms = round((perf_counter() - rerank_started) * 1000)
+        return RetrievalTrace(
+            candidates=candidates,
+            vector_selected=vector_selected,
+            selected=selected,
+            retrieval_status=retrieval_status,
+            vector_latency_ms=vector_latency_ms,
+            rerank_latency_ms=rerank_latency_ms,
+        )
 
     @staticmethod
     def _is_table_query(query: str) -> bool:
