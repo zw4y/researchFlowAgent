@@ -168,7 +168,7 @@ class AnswerEvaluationRunner:
 
         updated: list[AnswerCase] = []
         for case, result in zip(cases, results, strict=False):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.error("Scheme %s case %s failed: %s", scheme, case.case_id, result)
                 case.answers[scheme] = GeneratedAnswer(
                     case_id=case.case_id,
