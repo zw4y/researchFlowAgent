@@ -47,6 +47,8 @@ dev = [
 
 [project.scripts]
 researchflow-mcp = "app.mcp_server:run_stdio"
+researchflow-eval = "app.evaluation.cli:main"
+researchflow-generate-eval = "app.evaluation.generate_cases:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend/app"]
